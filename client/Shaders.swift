@@ -17,6 +17,7 @@ struct Params {
     float  lifeMin;
     float  lifeMax;
     float  fade;        // per-frame trail decay (used by the fade pass)
+    float  alpha;       // temporal blend between the two most recent field frames
 };
 
 // --- cheap integer hash -> [0,1) -------------------------------------------
@@ -34,19 +35,22 @@ inline float2 hash21(uint n) {
 
 constexpr sampler fieldSampler(coord::normalized, address::clamp_to_edge, filter::linear);
 
-// --- advection: move every particle through the sampled velocity field ------
-kernel void advect(device float2*      pos   [[buffer(0)]],
-                   device float*       life  [[buffer(1)]],
-                   device float*       spd   [[buffer(2)]],
-                   constant Params&    P     [[buffer(3)]],
-                   texture2d<float>    field [[texture(0)]],
+// --- advection: move every particle through the (time-interpolated) field ---
+kernel void advect(device float2*      pos       [[buffer(0)]],
+                   device float*       life      [[buffer(1)]],
+                   device float*       spd       [[buffer(2)]],
+                   constant Params&    P         [[buffer(3)]],
+                   texture2d<float>    fieldPrev [[texture(0)]],
+                   texture2d<float>    fieldCurr [[texture(1)]],
                    uint id [[thread_position_in_grid]])
 {
     if (id >= P.count) return;
 
     float2 x  = pos[id];
     float2 uv = x * 0.5 + 0.5;                       // [-1,1] -> [0,1]
-    float2 v  = field.sample(fieldSampler, uv).xy;   // bilinear (u, v)
+    float2 vp = fieldPrev.sample(fieldSampler, uv).xy;
+    float2 vc = fieldCurr.sample(fieldSampler, uv).xy;
+    float2 v  = mix(vp, vc, P.alpha);                // smooth between 30 Hz frames
 
     x += v * (P.dt * P.speed);
     float l = life[id] - P.dt;
@@ -102,6 +106,43 @@ fragment float4 point_fragment(PointOut in [[stage_in]],
     return float4(in.color * a, a);          // premultiplied, additive
 }
 
+// --- vortex markers (the "motor" of the flow) -------------------------------
+struct MarkerOut {
+    float4 position [[position]];
+    float  psize    [[point_size]];
+    float3 color;
+    float  glow;
+};
+
+vertex MarkerOut marker_vertex(uint vid [[vertex_id]],
+                               device const float* vort [[buffer(0)]],  // packed x,y,gamma
+                               constant Params&    P    [[buffer(1)]])
+{
+    float x = vort[3 * vid + 0];
+    float y = vort[3 * vid + 1];
+    float g = vort[3 * vid + 2];
+
+    MarkerOut o;
+    o.position = float4(float2(x, y) * P.aspect, 0.0, 1.0);
+    float mag  = fabs(g);
+    o.psize    = 10.0 + mag * 12.0;
+    // warm = counter-clockwise (+), cool = clockwise (-)
+    float3 warm = float3(1.00, 0.45, 0.15);
+    float3 cool = float3(0.25, 0.60, 1.00);
+    o.color = (g >= 0.0) ? warm : cool;
+    o.glow  = clamp(mag, 0.0, 1.5);
+    return o;
+}
+
+fragment float4 marker_fragment(MarkerOut in [[stage_in]], float2 pc [[point_coord]])
+{
+    float d    = length(pc - 0.5) * 2.0;          // 0 centre .. 1 edge
+    float core = smoothstep(0.30, 0.0, d);
+    float halo = smoothstep(1.0, 0.30, d) * 0.45;
+    float a    = core + halo;
+    return float4(in.color * (0.5 + in.glow) * a, a);
+}
+
 // --- fullscreen triangle ----------------------------------------------------
 struct FSOut { float4 position [[position]]; float2 uv; };
 
@@ -113,13 +154,10 @@ vertex FSOut fs_vertex(uint vid [[vertex_id]]) {
     return o;
 }
 
-// fade pass: returns black with alpha = fade; blend configured so the trail
-// texture is multiplied by (1 - fade) each frame.
 fragment float4 fade_fragment(FSOut in [[stage_in]], constant Params& P [[buffer(0)]]) {
     return float4(0.0, 0.0, 0.0, P.fade);
 }
 
-// present: tonemap the HDR trail into the drawable
 fragment float4 present_fragment(FSOut in [[stage_in]],
                                  texture2d<float> trail [[texture(0)]])
 {

@@ -67,6 +67,7 @@ final class ControlPanel {
 
         // ---- actions ----
         section("Actions")
+        toggle("Show vortices", true) { renderer.setShowVortices($0) }
         button("Reseed vortices") { client.reseedVortices() }
         button("Reset particles") { renderer.resetParticles() }
         button("Clear trail") { renderer.resetTrail() }
@@ -124,6 +125,14 @@ final class ControlPanel {
         b.bezelStyle = .rounded
         b.translatesAutoresizingMaskIntoConstraints = false
         b.widthAnchor.constraint(equalToConstant: 224).isActive = true
+        stack.addArrangedSubview(b)
+    }
+
+    private func toggle(_ title: String, _ initial: Bool, apply: @escaping (Bool) -> Void) {
+        let target = ActionTarget { c in apply((c as! NSButton).state == .on) }
+        targets.append(target)
+        let b = NSButton(checkboxWithTitle: title, target: target, action: #selector(ActionTarget.fire(_:)))
+        b.state = initial ? .on : .off
         stack.addArrangedSubview(b)
     }
 }

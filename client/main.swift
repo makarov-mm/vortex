@@ -68,8 +68,8 @@ app.mainMenu = mainMenu
 let host = ProcessInfo.processInfo.environment["VORTEX_HOST"] ?? "127.0.0.1"
 let port = UInt16(ProcessInfo.processInfo.environment["VORTEX_PORT"] ?? "4000") ?? 4000
 
-let client = FieldClient(host: host, port: port) { w, h, field in
-    renderer.updateField(w: w, h: h, bytes: field)
+let client = FieldClient(host: host, port: port) { w, h, field, vcount, vdata in
+    renderer.updateField(w: w, h: h, field: field, vortexCount: vcount, vortexBytes: vdata)
 }
 client.start()
 

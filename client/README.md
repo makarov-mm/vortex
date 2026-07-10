@@ -1,12 +1,12 @@
 # VortexClient — Swift + Metal frontend (macOS)
 
 Advects ~1,000,000 particles through the velocity field streamed by the
-`vortex_field` Elixir backend, with HDR feedback trails and a tonemapped
+`server` Elixir backend, with HDR feedback trails and a tonemapped
 present pass. Zero third-party dependencies (AppKit, MetalKit, Network only).
 
 ## Run
 
-Start the backend first (in the `vortex_field` folder: `./run.sh`), then here:
+Start the backend first (in `../server`: `./run.sh`), then here:
 
 ```sh
 ./run.sh            # swift build -c release && swift run -c release VortexClient
@@ -20,16 +20,20 @@ Requires the Xcode Command Line Tools (`xcode-select --install`) for `swift`.
 ## How it fits together each frame
 
 1. **network** (`FieldClient`) — reads one frame per tick (4-byte BE length,
-   then `w,h,frame_index,float32 field[w*h*2]` little-endian) and hands the raw
-   field bytes to the renderer, which uploads them into an `rg32Float` texture.
-2. **advect** (compute) — every particle bilinearly samples the field texture,
-   steps `pos += v·dt·speed`, and respawns (hash-seeded) when it expires or
-   leaves the domain.
-3. **trail** (one render pass into an `rgba16Float` texture) — a fullscreen
-   fade quad multiplies the accumulator by `(1-fade)`, then particles are drawn
-   additively as soft round sprites, coloured by speed.
-4. **present** — the HDR trail is Reinhard-tonemapped + gamma-corrected into the
-   drawable.
+   then `w,h,frame_index,vortex_count,reserved`, the `float32` field, and a
+   trailing `float32 (x,y,gamma)` list). The field goes into an `rg32Float`
+   texture; the vortex list into a small buffer.
+2. **advect** (compute) — every particle bilinearly samples the field and steps
+   `pos += v·dt·speed`, respawning when it expires or leaves the domain. The
+   field is **time-interpolated**: the two most recent 30 Hz frames are kept and
+   blended by arrival time, so motion stays smooth between updates.
+3. **trail** (one render pass into an `rgba16Float` texture) — a fullscreen fade
+   quad multiplies the accumulator by `(1-fade)`, then particles are drawn
+   additively as soft sprites, coloured by speed.
+4. **present** — the HDR trail is Reinhard-tonemapped + gamma-corrected.
+5. **markers** — the vortex cores are drawn as additive glows on top: warm =
+   counter-clockwise (+Γ), cool = clockwise (−Γ), size by |Γ|. Toggle in the
+   panel or with `v`.
 
 ## Controls
 
@@ -50,6 +54,7 @@ focus); current look values show in the title bar.
 | `-` `=` | advection speed                                    |
 | `,` `.` | point size                                         |
 | `1`–`4` | particle count: 250k / 500k / 750k / 1M            |
+| `v`     | show / hide vortex markers                         |
 | `r`     | reset (clear) the trail                            |
 | `Cmd-Q` | quit                                               |
 

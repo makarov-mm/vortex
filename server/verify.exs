@@ -78,11 +78,18 @@ field_vs = [{0.05, -0.02, 1.0}, {-0.1, 0.1, -0.6}]
 iodata =
   Field.rasterize(field_vs, w: w, h: h, domain: 1.0, delta: delta, max_speed: 6.0)
 
-frame = Protocol.encode_frame(w, h, 42, iodata) |> IO.iodata_to_binary()
+{vcount, vdata} = Protocol.encode_vortices(field_vs)
+frame = Protocol.encode_frame(w, h, 42, vcount, iodata, vdata) |> IO.iodata_to_binary()
 
-<<pw::unsigned-little-16, ph::unsigned-little-16, idx::unsigned-little-32, rest::binary>> = frame
-pass.("header decodes (w,h,frame_index)", pw == w and ph == h and idx == 42)
-pass.("payload byte length == 8 + w*h*2*4", byte_size(frame) == 8 + w * h * 2 * 4)
+<<pw::unsigned-little-16, ph::unsigned-little-16, idx::unsigned-little-32,
+  vc::unsigned-little-16, _res::unsigned-little-16, rest::binary>> = frame
+
+pass.("header decodes (w,h,frame_index,vortex_count)",
+  pw == w and ph == h and idx == 42 and vc == 2)
+
+field_bytes = w * h * 2 * 4
+pass.("total length == 12 + field + vortex_count*12",
+  byte_size(frame) == 12 + field_bytes + vc * 12)
 
 # re-sample cell (i=1, j=2) directly and compare with the bytes at that offset
 i = 1
@@ -98,5 +105,15 @@ off = cell * 8
 <<_::binary-size(off), gu::float-little-32, gv::float-little-32, _::binary>> = rest
 pass.("grid cell (1,2) bytes match a direct field sample (float32 tol)",
   approx.(gu, eu, 1.0e-5) and approx.(gv, ev, 1.0e-5))
+
+IO.puts("\n== 6. vortex markers trail the field ==")
+<<_field::binary-size(field_bytes), vbytes::binary>> = rest
+<<x0::float-little-32, y0::float-little-32, g0::float-little-32,
+  x1::float-little-32, y1::float-little-32, g1::float-little-32>> = vbytes
+
+pass.("first vortex marker matches source",
+  approx.(x0, 0.05, 1.0e-6) and approx.(y0, -0.02, 1.0e-6) and approx.(g0, 1.0, 1.0e-6))
+pass.("second vortex marker matches source (incl. negative gamma)",
+  approx.(x1, -0.1, 1.0e-6) and approx.(y1, 0.1, 1.0e-6) and approx.(g1, -0.6, 1.0e-6))
 
 IO.puts("")

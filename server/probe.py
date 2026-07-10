@@ -15,11 +15,12 @@ def read_frame(sock):
     # gen_tcp {packet,4} prepends a 4-byte BIG-endian length
     (length,) = struct.unpack(">I", recv_exact(sock, 4))
     payload = recv_exact(sock, length)
-    w, h, idx = struct.unpack("<HHI", payload[:8])
-    body = payload[8:]
-    assert len(body) == w * h * 2 * 4, (len(body), w * h * 2 * 4)
-    field = struct.unpack("<%df" % (w * h * 2), body)
-    return w, h, idx, field
+    w, h, idx, vc, _res = struct.unpack("<HHIHH", payload[:12])
+    fbytes = w * h * 2 * 4
+    field = struct.unpack("<%df" % (w * h * 2), payload[12:12 + fbytes])
+    vraw = payload[12 + fbytes:12 + fbytes + vc * 12]
+    vortices = [struct.unpack("<fff", vraw[k*12:k*12+12]) for k in range(vc)]
+    return w, h, idx, field, vortices
 
 ARROWS = "→↗↑↖←↙↓↘"
 def arrow(u, v):
@@ -50,16 +51,20 @@ def main():
     print(f"connected to {HOST}:{PORT}")
     idxs = []
     last = None
+    vlast = []
     for f in range(90):  # ~3s at 30fps
-        w, h, idx, field = read_frame(s)
+        w, h, idx, field, vortices = read_frame(s)
         idxs.append(idx)
         last = (w, h, idx, field)
+        vlast = vortices
     w, h, idx, field = last
     speeds = [math.hypot(field[2*c], field[2*c+1]) for c in range(w*h)]
     art, spmax = quiver(w, h, field)
     print(f"\ngrid {w}x{h}   frames read: {len(idxs)}   "
           f"frame_index {idxs[0]}..{idxs[-1]} (Δ={idxs[-1]-idxs[0]})")
-    print(f"speed  min={min(speeds):.3f}  mean={sum(speeds)/len(speeds):.3f}  max={max(speeds):.3f}\n")
+    pos = sum(1 for v in vlast if v[2] > 0); neg = len(vlast) - pos
+    print(f"speed  min={min(speeds):.3f}  mean={sum(speeds)/len(speeds):.3f}  max={max(speeds):.3f}")
+    print(f"vortices: {len(vlast)}  (+{pos} ccw / -{neg} cw)  e.g. {tuple(round(c,3) for c in vlast[0]) if vlast else None}\n")
     print(art)
     s.close()
 

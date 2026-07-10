@@ -8,11 +8,11 @@ import Network
 /// is little-endian: `uint16 w, uint16 h, uint32 frame_index, float32 field[w*h*2]`.
 final class FieldClient {
     private let conn: NWConnection
-    private let onFrame: (_ w: Int, _ h: Int, _ field: Data) -> Void
+    private let onFrame: (_ w: Int, _ h: Int, _ field: Data, _ vcount: Int, _ vdata: Data) -> Void
     private let queue = DispatchQueue(label: "vortex.field.client", qos: .userInteractive)
 
     init(host: String, port: UInt16,
-         onFrame: @escaping (_ w: Int, _ h: Int, _ field: Data) -> Void) {
+         onFrame: @escaping (_ w: Int, _ h: Int, _ field: Data, _ vcount: Int, _ vdata: Data) -> Void) {
         self.onFrame = onFrame
         self.conn = NWConnection(
             host: NWEndpoint.Host(host),
@@ -63,15 +63,21 @@ final class FieldClient {
         readExactly(n) { [weak self] data in
             guard let self else { return }
             let b = [UInt8](data)
+            guard b.count >= 12 else { self.readLength(); return }
             let w = Int(b[0]) | (Int(b[1]) << 8)
             let h = Int(b[2]) | (Int(b[3]) << 8)
             // b[4..7] = frame_index (LE) — not needed by the renderer
-            let expected = w * h * 2 * MemoryLayout<Float>.size
-            if data.count - 8 == expected {
-                let field = data.subdata(in: 8..<data.count)
-                self.onFrame(w, h, field)
+            let vc = Int(b[8]) | (Int(b[9]) << 8)
+            // b[10..11] = reserved
+
+            let fieldLen = w * h * 2 * MemoryLayout<Float>.size
+            let vLen = vc * 3 * MemoryLayout<Float>.size
+            if data.count == 12 + fieldLen + vLen {
+                let field = data.subdata(in: 12 ..< 12 + fieldLen)
+                let vdata = vLen > 0 ? data.subdata(in: 12 + fieldLen ..< 12 + fieldLen + vLen) : Data()
+                self.onFrame(w, h, field, vc, vdata)
             } else {
-                print("[net] bad frame: got \(data.count - 8) field bytes, expected \(expected)")
+                print("[net] bad frame: \(data.count) bytes, expected \(12 + fieldLen + vLen)")
             }
             self.readLength()   // next frame
         }

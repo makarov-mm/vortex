@@ -14,21 +14,22 @@ struct Params {
     var lifeMin: Float = 0
     var lifeMax: Float = 0
     var fade: Float = 0
+    var alpha: Float = 1
 }
 
 final class Renderer: NSObject, MTKViewDelegate {
 
-    // ---- live tunables (adjusted at runtime via the keyboard) --------------
-    // starting point leans "silky filaments" rather than "smoke"
+    // ---- live tunables (adjusted at runtime via the panel / keyboard) ------
     private var particleCount = 500_000
-    private var speed: Float = 0.45        // advection speed multiplier
-    private var pointSize: Float = 1.1     // particle sprite size (px)
-    private var fade: Float = 0.09         // trail decay/frame (bigger = shorter tail)
-    private var lifeMin: Float = 2.0       // particle lifetime range (seconds)
+    private var speed: Float = 0.45
+    private var pointSize: Float = 1.1
+    private var fade: Float = 0.09
+    private var lifeMin: Float = 2.0
     private var lifeMax: Float = 9.0
-    private let gridFallback = 64          // field texture size before first frame
+    private var showVortices = true
+    private let gridFallback = 64
+    private let maxVortices = 200
 
-    /// Pushed to the UI (window title) whenever a value changes.
     var onStatus: ((String) -> Void)?
 
     // ---- Metal objects -----------------------------------------------------
@@ -40,14 +41,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var pointPSO: MTLRenderPipelineState!
     private var fadePSO: MTLRenderPipelineState!
     private var presentPSO: MTLRenderPipelineState!
+    private var markerPSO: MTLRenderPipelineState!
 
     private var posBuf: MTLBuffer!
     private var lifeBuf: MTLBuffer!
     private var spdBuf: MTLBuffer!
+    private var vortexBuf: MTLBuffer!
+    private var vortexCount = 0
 
-    private var fieldTex: MTLTexture!
+    // two field frames + arrival times, blended in the advect kernel
+    private var fieldTex: [MTLTexture] = []
+    private var curIdx = 0
     private var fieldW = 0
     private var fieldH = 0
+    private var tPrev: CFTimeInterval = 0
+    private var tCurr: CFTimeInterval = 0
 
     private var trailTex: MTLTexture!
     private var trailNeedsClear = true
@@ -55,9 +63,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var params = Params()
     private var lastTime: CFTimeInterval = 0
 
-    // ---- incoming field frames (written on the network queue) --------------
+    // ---- incoming frames (written on the network queue) --------------------
     private let fieldLock = NSLock()
-    private var pendingField: (w: Int, h: Int, data: Data)?
+    private var pendingField: (w: Int, h: Int, field: Data, vcount: Int, vdata: Data)?
 
     // ------------------------------------------------------------------------
     init(view: MTKView, device: MTLDevice) throws {
@@ -69,7 +77,9 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         try buildPipelines()
         buildParticles()
-        buildFieldTexture(w: gridFallback, h: gridFallback, zeroed: true)
+        vortexBuf = device.makeBuffer(length: maxVortices * 3 * MemoryLayout<Float>.stride,
+                                      options: .storageModeShared)
+        buildFieldTextures(w: gridFallback, h: gridFallback)
 
         params.count = UInt32(particleCount)
         params.lifeMin = lifeMin
@@ -78,9 +88,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     struct Rerr: Error { let msg: String; init(_ m: String) { msg = m } }
 
-    // ---- keyboard tuning ---------------------------------------------------
-    //   [ ]  trail length      - =  speed        , .  point size
-    //   1-4  particle count    r    reset trail
+    // ---- keyboard tuning (mirrors the panel) -------------------------------
     func handleKey(_ s: String) {
         switch s {
         case "]": fade = min(fade + 0.01, 0.40)
@@ -93,6 +101,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         case "2": setParticleCount(500_000)
         case "3": setParticleCount(750_000)
         case "4": setParticleCount(1_000_000)
+        case "v", "V": showVortices.toggle()
         case "r", "R": trailNeedsClear = true
         default: return
         }
@@ -116,6 +125,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     func setFade(_ v: Float) { fade = v; emitStatus() }
     func setPointSize(_ v: Float) { pointSize = v; emitStatus() }
     func setParticles(_ n: Int) { setParticleCount(n); emitStatus() }
+    func setShowVortices(_ b: Bool) { showVortices = b }
     func resetParticles() { buildParticles(); trailNeedsClear = true }
     func resetTrail() { trailNeedsClear = true }
 
@@ -130,22 +140,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     private func buildPipelines() throws {
         let lib = try device.makeLibrary(source: shaderSource, options: nil)
 
-        let advect = lib.makeFunction(name: "advect")!
-        advectPSO = try device.makeComputePipelineState(function: advect)
+        advectPSO = try device.makeComputePipelineState(function: lib.makeFunction(name: "advect")!)
 
         // particle points -> HDR trail (additive)
         let pd = MTLRenderPipelineDescriptor()
         pd.vertexFunction = lib.makeFunction(name: "point_vertex")
         pd.fragmentFunction = lib.makeFunction(name: "point_fragment")
-        let ca = pd.colorAttachments[0]!
-        ca.pixelFormat = .rgba16Float
-        ca.isBlendingEnabled = true
-        ca.rgbBlendOperation = .add
-        ca.alphaBlendOperation = .add
-        ca.sourceRGBBlendFactor = .one
-        ca.sourceAlphaBlendFactor = .one
-        ca.destinationRGBBlendFactor = .one
-        ca.destinationAlphaBlendFactor = .one
+        configureAdditive(pd.colorAttachments[0]!, format: .rgba16Float)
         pointPSO = try device.makeRenderPipelineState(descriptor: pd)
 
         // fade quad -> multiplies trail by (1 - fade)
@@ -169,6 +170,25 @@ final class Renderer: NSObject, MTKViewDelegate {
         sd.fragmentFunction = lib.makeFunction(name: "present_fragment")
         sd.colorAttachments[0].pixelFormat = colorPixelFormat
         presentPSO = try device.makeRenderPipelineState(descriptor: sd)
+
+        // vortex markers -> drawable (additive glow, drawn after present)
+        let md = MTLRenderPipelineDescriptor()
+        md.vertexFunction = lib.makeFunction(name: "marker_vertex")
+        md.fragmentFunction = lib.makeFunction(name: "marker_fragment")
+        configureAdditive(md.colorAttachments[0]!, format: colorPixelFormat)
+        markerPSO = try device.makeRenderPipelineState(descriptor: md)
+    }
+
+    private func configureAdditive(_ a: MTLRenderPipelineColorAttachmentDescriptor,
+                                   format: MTLPixelFormat) {
+        a.pixelFormat = format
+        a.isBlendingEnabled = true
+        a.rgbBlendOperation = .add
+        a.alphaBlendOperation = .add
+        a.sourceRGBBlendFactor = .one
+        a.sourceAlphaBlendFactor = .one
+        a.destinationRGBBlendFactor = .one
+        a.destinationAlphaBlendFactor = .one
     }
 
     // ---- particle buffers --------------------------------------------------
@@ -192,18 +212,26 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     // ---- textures ----------------------------------------------------------
-    private func buildFieldTexture(w: Int, h: Int, zeroed: Bool) {
+    private func buildFieldTextures(w: Int, h: Int) {
         let d = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rg32Float, width: w, height: h, mipmapped: false)
         d.usage = .shaderRead
         d.storageMode = .shared
-        fieldTex = device.makeTexture(descriptor: d)
+        fieldTex = [device.makeTexture(descriptor: d)!, device.makeTexture(descriptor: d)!]
         fieldW = w; fieldH = h
-        if zeroed {
-            let zeros = [Float](repeating: 0, count: w * h * 2)
-            fieldTex.replace(region: MTLRegionMake2D(0, 0, w, h),
-                             mipmapLevel: 0, withBytes: zeros,
-                             bytesPerRow: w * 2 * MemoryLayout<Float>.size)
+        let zeros = [Float](repeating: 0, count: w * h * 2)
+        for t in fieldTex {
+            t.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0,
+                      withBytes: zeros, bytesPerRow: w * 2 * MemoryLayout<Float>.size)
+        }
+        curIdx = 0
+        tPrev = CACurrentMediaTime(); tCurr = tPrev
+    }
+
+    private func uploadField(_ tex: MTLTexture, _ data: Data, _ w: Int, _ h: Int) {
+        data.withUnsafeBytes { raw in
+            tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0,
+                        withBytes: raw.baseAddress!, bytesPerRow: w * 2 * MemoryLayout<Float>.size)
         }
     }
 
@@ -217,10 +245,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         trailNeedsClear = true
     }
 
-    // ---- field update (called from the network queue) ----------------------
-    func updateField(w: Int, h: Int, bytes: Data) {
+    // ---- frame update (called from the network queue) ----------------------
+    func updateField(w: Int, h: Int, field: Data, vortexCount: Int, vortexBytes: Data) {
         fieldLock.lock()
-        pendingField = (w, h, bytes)
+        pendingField = (w, h, field, vortexCount, vortexBytes)
         fieldLock.unlock()
     }
 
@@ -231,14 +259,27 @@ final class Renderer: NSObject, MTKViewDelegate {
         fieldLock.unlock()
         guard let p = pending else { return }
 
+        let now = CACurrentMediaTime()
+
         if p.w != fieldW || p.h != fieldH {
-            buildFieldTexture(w: p.w, h: p.h, zeroed: false)
+            // resize: both frames become the new field, no blend across the change
+            buildFieldTextures(w: p.w, h: p.h)
+            uploadField(fieldTex[0], p.field, p.w, p.h)
+            uploadField(fieldTex[1], p.field, p.w, p.h)
+            tPrev = now; tCurr = now
+        } else {
+            curIdx ^= 1                       // newest becomes current, old becomes previous
+            uploadField(fieldTex[curIdx], p.field, p.w, p.h)
+            tPrev = tCurr; tCurr = now
         }
-        p.data.withUnsafeBytes { raw in
-            fieldTex.replace(region: MTLRegionMake2D(0, 0, p.w, p.h),
-                             mipmapLevel: 0,
-                             withBytes: raw.baseAddress!,
-                             bytesPerRow: p.w * 2 * MemoryLayout<Float>.size)
+
+        // vortex markers
+        let n = min(p.vcount, maxVortices)
+        vortexCount = n
+        if n > 0 {
+            p.vdata.withUnsafeBytes { raw in
+                memcpy(vortexBuf.contents(), raw.baseAddress!, n * 3 * MemoryLayout<Float>.stride)
+            }
         }
     }
 
@@ -252,13 +293,11 @@ final class Renderer: NSObject, MTKViewDelegate {
               let drawable = view.currentDrawable,
               let cmd = queue.makeCommandBuffer() else { return }
 
-        // timing
         let now = CACurrentMediaTime()
         var dt = lastTime == 0 ? 1.0 / 60.0 : Float(now - lastTime)
         lastTime = now
-        dt = min(max(dt, 0), 1.0 / 30.0)      // clamp against stalls
+        dt = min(max(dt, 0), 1.0 / 30.0)
 
-        // refresh params from the live tunables
         params.dt = dt
         params.frame &+= 1
         params.speed = speed
@@ -266,20 +305,25 @@ final class Renderer: NSObject, MTKViewDelegate {
         params.fade = fade
         params.count = UInt32(particleCount)
 
-        // aspect: fit the [-1,1] square into the view
         let W = Float(view.drawableSize.width), H = Float(view.drawableSize.height)
         params.aspect = W > H ? SIMD2<Float>(H / W, 1) : SIMD2<Float>(1, W / H)
 
         consumePendingField()
 
-        // 1) advect particles
+        // temporal blend factor between the two most recent field frames
+        let interval = tCurr - tPrev
+        params.alpha = interval > 0 ? Float(min(max((now - tCurr) / interval, 0), 1)) : 1
+        let prevIdx = curIdx ^ 1
+
+        // 1) advect particles through the interpolated field
         if let ce = cmd.makeComputeCommandEncoder() {
             ce.setComputePipelineState(advectPSO)
             ce.setBuffer(posBuf, offset: 0, index: 0)
             ce.setBuffer(lifeBuf, offset: 0, index: 1)
             ce.setBuffer(spdBuf, offset: 0, index: 2)
             ce.setBytes(&params, length: MemoryLayout<Params>.stride, index: 3)
-            ce.setTexture(fieldTex, index: 0)
+            ce.setTexture(fieldTex[prevIdx], index: 0)
+            ce.setTexture(fieldTex[curIdx], index: 1)
             let tpg = MTLSize(width: 256, height: 1, depth: 1)
             let grid = MTLSize(width: particleCount, height: 1, depth: 1)
             ce.dispatchThreads(grid, threadsPerThreadgroup: tpg)
@@ -316,6 +360,21 @@ final class Renderer: NSObject, MTKViewDelegate {
                 pe.setFragmentTexture(trailTex, index: 0)
                 pe.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 pe.endEncoding()
+            }
+        }
+
+        // 4) vortex markers -> drawable (glow on top)
+        if showVortices && vortexCount > 0 {
+            let mp = MTLRenderPassDescriptor()
+            mp.colorAttachments[0].texture = drawable.texture
+            mp.colorAttachments[0].loadAction = .load
+            mp.colorAttachments[0].storeAction = .store
+            if let me = cmd.makeRenderCommandEncoder(descriptor: mp) {
+                me.setRenderPipelineState(markerPSO)
+                me.setVertexBuffer(vortexBuf, offset: 0, index: 0)
+                me.setVertexBytes(&params, length: MemoryLayout<Params>.stride, index: 1)
+                me.drawPrimitives(type: .point, vertexStart: 0, vertexCount: vortexCount)
+                me.endEncoding()
             }
         }
 
