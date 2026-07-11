@@ -10,6 +10,7 @@ let package = Package(
     .executableTarget(
       name: "VortexClient",
       path: ".",
+      exclude: ["README.md", "run.sh"],
       sources: [
         "main.swift",
         "Renderer.swift",

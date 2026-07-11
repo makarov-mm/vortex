@@ -278,7 +278,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         vortexCount = n
         if n > 0 {
             p.vdata.withUnsafeBytes { raw in
-                memcpy(vortexBuf.contents(), raw.baseAddress!, n * 3 * MemoryLayout<Float>.stride)
+                _ = memcpy(vortexBuf.contents(), raw.baseAddress!, n * 3 * MemoryLayout<Float>.stride)
             }
         }
     }

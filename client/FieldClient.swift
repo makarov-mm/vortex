@@ -37,8 +37,7 @@ final class FieldClient {
 
     // read exactly `n` bytes, then hand them to `done`
     private func readExactly(_ n: Int, _ done: @escaping (Data) -> Void) {
-        conn.receive(minimumIncompleteLength: n, maximumLength: n) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+        conn.receive(minimumIncompleteLength: n, maximumLength: n) { data, _, isComplete, error in
             if let error {
                 print("[net] receive error: \(error)")
                 return
