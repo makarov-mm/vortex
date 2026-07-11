@@ -17,7 +17,7 @@ TCP to a **Swift + Metal** client that advects ~1,000,000 particles through it
 with feedback trails. Nothing is scripted — the motion is emergent.
 
 ## Screenshot
-![Screenshot](screenshot.jpg)
+![Screenshot](screenshot.png)
 
 Zero third-party dependencies on either side: Elixir stdlib (`:gen_tcp`,
 `Registry`, `Task`) and Apple frameworks (Metal, MetalKit, AppKit, Network).
